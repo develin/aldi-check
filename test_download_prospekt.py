@@ -8,6 +8,7 @@ import json
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError
 
 import download_prospekt as dp
 
@@ -35,14 +36,34 @@ class ResolveLatestSlugTests(unittest.TestCase):
 
         self.assertEqual(slug, "kw34-26-op-mp")
 
+    def test_extracts_slug_ignoring_query_string(self):
+        cm = self._mock_urlopen("https://prospekt.aldi-sued.de/kw34-26-op-mp/?utm_source=x")
+        with mock.patch.object(dp.urllib.request, "urlopen", return_value=cm):
+            slug = dp.resolve_latest_slug()
+
+        self.assertEqual(slug, "kw34-26-op-mp")
+
     def test_raises_runtime_error_when_slug_cannot_be_determined(self):
-        # After rstrip("/"), this becomes "https://prospekt.aldi-sued.de",
-        # whose only "/" is immediately followed by a segment containing
-        # dots, so r"/([\w-]+)/?$" cannot match anywhere in the string.
+        # The URL path is just "/", which has no non-empty last segment.
         cm = self._mock_urlopen("https://prospekt.aldi-sued.de/")
         with mock.patch.object(dp.urllib.request, "urlopen", return_value=cm):
             with self.assertRaises(RuntimeError):
                 dp.resolve_latest_slug()
+
+
+class BestImageUrlTests(unittest.TestCase):
+    def test_prefers_highest_configured_resolution(self):
+        page = {"images": {"at2400": "/a-2400.jpg", "at2000": "/a-2000.jpg"}}
+        self.assertEqual(dp.best_image_url(page), f"{dp.BASE_HOST}/a-2400.jpg")
+
+    def test_falls_back_when_preferred_resolution_missing(self):
+        page = {"images": {"at1200": "/a-1200.jpg", "at600": "/a-600.jpg"}}
+        self.assertEqual(dp.best_image_url(page), f"{dp.BASE_HOST}/a-1200.jpg")
+
+    def test_raises_when_no_known_resolution_present(self):
+        page = {"images": {"unknown": "/a.jpg"}}
+        with self.assertRaises(RuntimeError):
+            dp.best_image_url(page)
 
 
 class CollectPageImageUrlsTests(unittest.TestCase):
@@ -75,12 +96,18 @@ class CollectPageImageUrlsTests(unittest.TestCase):
                 ]
             },
         ]
+        not_found = HTTPError(url="x", code=400, msg="Invalid page", hdrs=None, fp=None)
 
-        with mock.patch.object(dp, "fetch", return_value=json.dumps(manifest)) as mock_fetch:
+        with mock.patch.object(
+            dp, "fetch", side_effect=[json.dumps(manifest), not_found]
+        ) as mock_fetch:
             urls = dp.collect_page_image_urls("kw34-26-op-mp")
 
-        mock_fetch.assert_called_once_with(
-            f"{dp.BASE_HOST}/kw34-26-op-mp/spreads.json?page=1"
+        mock_fetch.assert_has_calls(
+            [
+                mock.call(f"{dp.BASE_HOST}/kw34-26-op-mp/spreads.json?page=1"),
+                mock.call(f"{dp.BASE_HOST}/kw34-26-op-mp/spreads.json?page=2"),
+            ]
         )
         self.assertEqual(
             urls,
@@ -90,6 +117,30 @@ class CollectPageImageUrlsTests(unittest.TestCase):
                 f"{dp.BASE_HOST}/slug/page3-2400.jpg",
             ],
         )
+
+    def test_stops_on_empty_manifest_page(self):
+        with mock.patch.object(
+            dp, "fetch", side_effect=[json.dumps([]), json.dumps([{"pages": []}])]
+        ) as mock_fetch:
+            urls = dp.collect_page_image_urls("kw34-26-op-mp")
+
+        mock_fetch.assert_called_once_with(f"{dp.BASE_HOST}/kw34-26-op-mp/spreads.json?page=1")
+        self.assertEqual(urls, [])
+
+    def test_reraises_http_error_on_first_page(self):
+        first_page_error = HTTPError(url="x", code=500, msg="Server error", hdrs=None, fp=None)
+        with mock.patch.object(dp, "fetch", side_effect=first_page_error):
+            with self.assertRaises(HTTPError):
+                dp.collect_page_image_urls("kw34-26-op-mp")
+
+    def test_reraises_non_400_http_error_on_later_page(self):
+        manifest = [{"pages": [{"images": {"at2400": "/slug/page1-2400.jpg"}}]}]
+        later_page_error = HTTPError(url="x", code=500, msg="Server error", hdrs=None, fp=None)
+        with mock.patch.object(
+            dp, "fetch", side_effect=[json.dumps(manifest), later_page_error]
+        ):
+            with self.assertRaises(HTTPError):
+                dp.collect_page_image_urls("kw34-26-op-mp")
 
 
 class DownloadFlyerTests(unittest.TestCase):

@@ -13,8 +13,8 @@ highest resolution available and assembles the pages into a single PDF.
 import argparse
 import io
 import json
-import re
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -26,7 +26,9 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-IMAGE_RESOLUTION = "at2400"  # highest resolution offered by the viewer
+# Preference order for page image resolution; the first one present on a
+# given page is used, since not every page is guaranteed to offer at2400.
+IMAGE_RESOLUTIONS = ("at2400", "at2000", "at1600", "at1200", "at1000", "at800", "at600", "at200")
 
 
 def fetch(url: str) -> bytes:
@@ -40,18 +42,36 @@ def resolve_latest_slug() -> str:
     request = urllib.request.Request(f"{BASE_HOST}/", headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=30) as response:
         final_url = response.geturl()
-    match = re.search(r"/([\w-]+)/?$", final_url.rstrip("/"))
-    if not match:
+    path = urllib.parse.urlparse(final_url).path.rstrip("/")
+    slug = path.rsplit("/", 1)[-1]
+    if not slug:
         raise RuntimeError(f"Could not determine flyer slug from redirect target: {final_url}")
-    return match.group(1)
+    return slug
+
+
+def best_image_url(page: dict) -> str:
+    for resolution in IMAGE_RESOLUTIONS:
+        if resolution in page["images"]:
+            return BASE_HOST + page["images"][resolution]
+    raise RuntimeError(f"No known image resolution found for page: {page}")
 
 
 def collect_page_image_urls(slug: str) -> list:
-    manifest = json.loads(fetch(f"{BASE_HOST}/{slug}/spreads.json?page=1"))
     urls = []
-    for spread in manifest:
-        for page in spread["pages"]:
-            urls.append(BASE_HOST + page["images"][IMAGE_RESOLUTION])
+    page_number = 1
+    while True:
+        try:
+            manifest = json.loads(fetch(f"{BASE_HOST}/{slug}/spreads.json?page={page_number}"))
+        except HTTPError as exc:
+            if page_number > 1 and exc.code == 400:
+                break
+            raise
+        if not manifest:
+            break
+        for spread in manifest:
+            for page in spread["pages"]:
+                urls.append(best_image_url(page))
+        page_number += 1
     return urls
 
 
